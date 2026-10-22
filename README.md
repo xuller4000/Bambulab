@@ -73,27 +73,6 @@ claude mcp add bambu \
 
 `bambu-mcp --transport streamable-http --port 8765` startet den Server unter `http://127.0.0.1:8765/mcp`. Ein Custom Connector auf claude.ai braucht allerdings eine öffentlich erreichbare HTTPS-Adresse, und der Drucker hängt im Heimnetz. Ohne Tunnel und eigene Authentifizierung davor ist die lokale Variante (Desktop oder Claude Code) die richtige.
 
-## Fernzugriff vom Handy (Cloudflare)
-
-Für die Claude-App auf dem Handy oder claude.ai im Browser läuft der Connector als kleiner Webserver auf dem Rechner, der im selben Netz wie der Drucker steht. Ein Cloudflare-Tunnel macht ihn über HTTPS erreichbar, ohne Ports am Router zu öffnen. Der Rechner muss dafür laufen.
-
-**Einrichten:** `bambu-mcp setup` fragt IP, Zugangscode, Modell-Ordner und (optional) die Tunnel-Adresse ab, erzeugt einen geheimen Schlüssel und legt auf Wunsch einen Autostart an. Alles landet in `~/.bambu-mcp/config.env`. Claude Desktop liest diese Datei ebenfalls, dort reichen dann `"command"` ohne `"env"`.
-
-**Variante A, Schnelltest ohne Konto:**
-
-```
-winget install --id Cloudflare.cloudflared
-bambu-mcp serve --quick-tunnel
-```
-
-Die angezeigte Adresse (`https://…trycloudflare.com/<schlüssel>/mcp`) kommt in claude.ai unter Einstellungen > Connectors > eigenen Connector hinzufügen. Sie ändert sich bei jedem Start.
-
-**Variante B, fester Tunnel:** braucht ein kostenloses Cloudflare-Konto und eine Domain, die bei Cloudflare liegt. Im Cloudflare-Dashboard unter Zero Trust > Networks > Tunnels einen Tunnel anlegen, den angezeigten Befehl zur Installation des Windows-Dienstes ausführen und einen Public Hostname eintragen (z. B. `drucker.deinedomain.de`, Service `HTTP`, URL `localhost:8765`). Diese Adresse bei `bambu-mcp setup` angeben, dann `bambu-mcp serve` starten. `bambu-mcp url` zeigt die Adresse für claude.ai.
-
-**Modelle vom Handy:** Dateien, die in der Claude-App angehängt werden, kommen beim Connector nicht an. Stattdessen legst du sie in den Modell-Ordner (liegt der in OneDrive, geht das direkt vom Handy) oder gibst Claude einen direkten Download-Link. `list_model_files` und `download_model` sind die passenden Tools. Im Fernzugriff akzeptiert der Server nur Dateien aus dem Modell-Ordner und lädt nichts aus dem lokalen Netz.
-
-**Sicherheit:** Der Schlüssel in der Adresse wirkt wie ein Passwort. Wer die vollständige Adresse kennt, kann den Drucker steuern, also nicht weitergeben. Für einen neuen Schlüssel die Zeile `BAMBU_HTTP_TOKEN` in `config.env` löschen, `bambu-mcp setup` erneut ausführen und die neue Adresse in claude.ai eintragen.
-
 ## Slicen und automatische Druckparameter
 
 Gesliced wird mit der Kommandozeile von Bambu Studio oder OrcaSlicer. Der Server sucht beides an den üblichen Orten (macOS `/Applications`, Windows `Program Files`, Linux im `PATH`) und nimmt die Bambu-Profile direkt aus der Installation, dazu deine eigenen Presets aus dem Benutzerordner. Exportieren musst du nichts. Die Profile speichern nur Abweichungen zu einem Elternprofil (`inherits`); der Server löst diese Ketten auf und übergibt dem Slicer vollständige Profile.

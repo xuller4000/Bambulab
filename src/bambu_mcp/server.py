@@ -20,7 +20,6 @@ from .discovery import find_serial
 from .ftps import PrinterFiles
 from .printer import BambuPrinter, PrinterError, summarize
 from .mesh import MeshError, analyze
-from .models import ModelError, download, list_models, model_dir, resolve_local
 from .profiles import ProfileError, machine_name
 from .slicer import SliceOptions, SlicerError
 from .workflow import NOZZLES, PLATE_TYPES, SliceRequest, library_for, plan, public, slice_request
@@ -35,10 +34,6 @@ for; they override the recommendation. Show the user the reasons, warnings
 and the time/weight estimate. Ask about the purpose (quality, strength,
 speed) when it is unclear and matters. recommend_print_settings previews
 the choice without slicing.
-Model files come from the model folder on the printer's computer
-(list_model_files; the user can drop files there, e.g. via OneDrive) or from
-a direct download link (download_model). Files attached in the chat do not
-reach this server; ask the user to put them in the model folder or give a link.
 For an already sliced .gcode.3mf: upload_and_print. Before starting a print,
 check that the printer is idle and the plate is clear; ask the user if unsure.
 Live tuning while printing: set_print_speed, set_temperature, set_part_fan.
@@ -76,7 +71,7 @@ async def run(fn, *args, **kwargs) -> Any:
     """Run blocking printer I/O off the event loop and turn errors into tool errors."""
     try:
         return await asyncio.to_thread(functools.partial(fn, *args, **kwargs))
-    except (PrinterError, SlicerError, ProfileError, MeshError, ModelError, ConfigError, FileNotFoundError) as exc:
+    except (PrinterError, SlicerError, ProfileError, MeshError, ConfigError, FileNotFoundError) as exc:
         raise ToolError(str(exc)) from exc
     except OSError as exc:
         raise ToolError(f"Network error talking to the printer: {exc}") from exc
@@ -127,12 +122,11 @@ async def list_sd_files(directory: str = "/") -> list[dict]:
 
 @mcp.tool(annotations=ACTION)
 async def upload_file(
-    local_path: Annotated[str, Field(description=".gcode.3mf/.gcode file: name in the model folder or full path")],
+    local_path: Annotated[str, Field(description="Path of a .gcode.3mf/.3mf/.gcode file on this computer")],
     remote_name: Annotated[str | None, Field(description="Name on the SD card, default: same file name")] = None,
 ) -> dict:
     """Upload a file to the printer's SD card without starting it."""
-    path = await run(resolve_local, local_path, settings())
-    return await run(files().upload, path, remote_name)
+    return await run(files().upload, local_path, remote_name)
 
 
 @mcp.tool(annotations=DESTRUCTIVE)
@@ -170,7 +164,7 @@ async def start_print(
 
 @mcp.tool(annotations=ACTION)
 async def upload_and_print(
-    local_path: Annotated[str, Field(description="Sliced .gcode.3mf (or .gcode): name in the model folder or full path")],
+    local_path: Annotated[str, Field(description="Sliced .gcode.3mf (or .gcode) on this computer")],
     plate: Plate = 1,
     bed_leveling: BedLeveling = True,
     flow_calibration: FlowCali = True,
@@ -180,8 +174,7 @@ async def upload_and_print(
     ams_mapping: AmsMapping = None,
 ) -> dict:
     """Upload a sliced file to the SD card and start it."""
-    path = await run(resolve_local, local_path, settings())
-    uploaded = await run(files().upload, path)
+    uploaded = await run(files().upload, local_path)
     started = await _start(
         uploaded["remote_name"], plate=plate, bed_leveling=bed_leveling,
         flow_calibration=flow_calibration, vibration_calibration=vibration_calibration,
@@ -272,25 +265,6 @@ async def send_gcode(gcode: Annotated[str, Field(description="One or more G-code
     return await run(printer().gcode, gcode)
 
 
-# -- model folder --------------------------------------------------------------
-
-@mcp.tool(annotations=READ_ONLY)
-async def list_model_files() -> dict:
-    """Models in the model folder on the printer's computer, newest first."""
-    root = await run(model_dir, settings())
-    return {"folder": str(root), "files": await run(list_models, root)}
-
-
-@mcp.tool(annotations=ACTION)
-async def download_model(
-    url: Annotated[str, Field(description="Direct link to an STL/3MF/OBJ/STEP file or a zip of them")],
-) -> dict:
-    """Download a model from a link into the model folder, so it can be sliced and printed."""
-    root = await run(model_dir, settings())
-    saved = await run(download, url, root)
-    return {"saved": [p.relative_to(root).as_posix() for p in saved]}
-
-
 # -- slicing -----------------------------------------------------------------
 
 Purpose = Annotated[
@@ -333,9 +307,7 @@ ExtraFilament = Annotated[
     dict[str, Any] | None,
     Field(description="Any other filament setting by its slicer key, e.g. {'fan_max_speed': 80}"),
 ]
-ModelPath = Annotated[
-    str, Field(description="STL/3MF/OBJ/STEP file: name in the model folder (see list_model_files) or full path")
-]
+ModelPath = Annotated[str, Field(description="STL/3MF/OBJ/STEP file on this computer")]
 
 
 def _printer_info(ams_slot: int | None = None) -> dict:
@@ -365,7 +337,6 @@ def _build_request(model_path: str, purpose: str, filament_type: str | None, fil
                    auto_tune: bool, auto_orient: bool, options: SliceOptions,
                    ams_slot: int | None = None) -> tuple[SliceRequest, dict]:
     s = settings()
-    model_path = str(resolve_local(model_path, s))
     source: dict[str, Any] = {}
     filament_id = None
     if use_printer_filament and not (filament_type or filament_preset) or nozzle is None and s.nozzle is None:
@@ -397,8 +368,7 @@ def _options(layer_height, infill_percent, infill_pattern, wall_loops, supports,
 @mcp.tool(annotations=READ_ONLY)
 async def analyze_model(model_path: ModelPath, auto_orient: AutoOrient = True) -> dict:
     """Geometry check: size, volume, bed contact, overhangs needing support, best orientation, fit on the A1 mini."""
-    path = await run(resolve_local, model_path, settings())
-    analysis, _ = await run(analyze, path, auto_orient=auto_orient)
+    analysis, _ = await run(analyze, model_path, auto_orient=auto_orient)
     return analysis.to_dict()
 
 
@@ -515,37 +485,13 @@ async def slice_and_print(
 
 
 def main() -> None:
-    global _settings
     parser = argparse.ArgumentParser(description="MCP connector for a Bambu Lab A1 mini")
-    sub = parser.add_subparsers(dest="command")
-    sub.add_parser("setup", help="Ask for printer data and create the config file")
-    serve_cmd = sub.add_parser("serve", help="Run for remote access (claude.ai / phone) behind a tunnel")
-    serve_cmd.add_argument("--quick-tunnel", action="store_true",
-                           help="Also start a Cloudflare quick tunnel (random trycloudflare.com address)")
-    sub.add_parser("url", help="Show the address to enter in claude.ai")
     parser.add_argument("--transport", choices=["stdio", "streamable-http"], default="stdio")
     parser.add_argument("--host", default="127.0.0.1", help="Bind address for streamable-http")
     parser.add_argument("--port", type=int, default=8765, help="Port for streamable-http")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
-
-    if args.command == "setup":
-        from .remote import setup
-        setup()
-    elif args.command in ("serve", "url"):
-        from .remote import connector_url, serve
-        try:
-            s = settings()
-        except ConfigError as exc:
-            raise SystemExit(f"{exc}") from exc
-        if not s.http_token:
-            raise SystemExit("Kein Zugangsschlüssel vorhanden. Erst 'bambu-mcp setup' ausführen.")
-        if args.command == "url":
-            print(connector_url(s.http_token, s.http_port, s.public_url))
-            return
-        _settings = replace(s, restrict_paths=True)
-        serve(mcp, s.http_token, s.http_port, public_url=s.public_url, quick_tunnel=args.quick_tunnel)
-    elif args.transport == "stdio":
+    if args.transport == "stdio":
         mcp.run()
     else:
         mcp.run(transport="streamable-http", host=args.host, port=args.port)
