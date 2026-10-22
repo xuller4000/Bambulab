@@ -46,6 +46,11 @@ def find_slicer(configured: str | None = None) -> SlicerInstall | None:
     elif os.name == "nt":
         pf = os.environ.get("ProgramFiles", r"C:\Program Files")
         candidates += [rf"{pf}\Bambu Studio\bambu-studio.exe", rf"{pf}\OrcaSlicer\orca-slicer.exe"]
+        # Portable copies often sit directly on another drive, e.g. E:\Bambu Studio.
+        for drive in "CDEFGHIJ":
+            for folder, exe in (("Bambu Studio", "bambu-studio.exe"), ("BambuStudio", "bambu-studio.exe"),
+                                ("OrcaSlicer", "orca-slicer.exe")):
+                candidates.append(rf"{drive}:\{folder}\{exe}")
     for name in ("bambu-studio", "BambuStudio", "orca-slicer", "OrcaSlicer"):
         if found := shutil.which(name):
             candidates.append(found)
