@@ -33,7 +33,8 @@ class Settings:
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Settings":
         env = dict(os.environ if env is None else env)
-        missing = [k for k in ("BAMBU_HOST", "BAMBU_SERIAL", "BAMBU_ACCESS_CODE") if not env.get(k)]
+        # The serial is optional: the server reads it from the printer if it is missing.
+        missing = [k for k in ("BAMBU_HOST", "BAMBU_ACCESS_CODE") if not env.get(k)]
         if missing:
             raise ConfigError(
                 "Missing environment variables: " + ", ".join(missing)
@@ -46,7 +47,7 @@ class Settings:
 
         return cls(
             host=env["BAMBU_HOST"].strip(),
-            serial=env["BAMBU_SERIAL"].strip(),
+            serial=env.get("BAMBU_SERIAL", "").strip(),
             access_code=env["BAMBU_ACCESS_CODE"].strip(),
             mqtt_port=int(env.get("BAMBU_MQTT_PORT", 8883)),
             ftp_port=int(env.get("BAMBU_FTP_PORT", 990)),

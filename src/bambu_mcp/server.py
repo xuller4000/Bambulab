@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import functools
 import logging
+from dataclasses import replace
 from typing import Annotated, Any, Literal
 
 from mcp.server.mcpserver import Image, MCPServer
@@ -15,6 +16,7 @@ from pydantic import Field
 
 from . import camera
 from .config import ConfigError, Settings
+from .discovery import find_serial
 from .ftps import PrinterFiles
 from .printer import BambuPrinter, PrinterError, summarize
 from .mesh import MeshError, analyze
@@ -51,9 +53,11 @@ def settings() -> Settings:
 
 
 def printer() -> BambuPrinter:
-    global _printer
+    global _printer, _settings
     if _printer is None:
         s = settings()
+        if not s.serial:
+            _settings = s = replace(s, serial=find_serial(s.host, s.mqtt_port))
         _printer = BambuPrinter(s.host, s.serial, s.access_code, port=s.mqtt_port, sdcard_root=s.sdcard_root)
     return _printer
 

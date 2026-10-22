@@ -25,7 +25,7 @@ MCP-Server für den Bambu Lab A1 mini. Er spricht den Drucker direkt im lokalen 
 ## Am Drucker vorbereiten
 
 1. Am Display unter Einstellungen > Netzwerk den **LAN-Modus** einschalten. Dort stehen auch IP-Adresse und **Zugangscode**.
-2. Die **Seriennummer** steht unter Einstellungen > Gerät (oder auf dem Aufkleber hinten).
+2. Die **Seriennummer** muss nicht eingetragen werden. Fehlt `BAMBU_SERIAL`, liest der Server sie aus dem Zertifikat des Druckers. Zum Nachsehen: `bambu-find` listet alle Bambu-Drucker im Netz mit IP und Seriennummer, `bambu-find <IP>` fragt einen bestimmten Drucker.
 3. Neuere Firmware hat die sogenannte Autorisierungssteuerung. Dann nimmt der Drucker Befehle von Drittsoftware nur im **Entwicklermodus** an (gleiches Menü wie der LAN-Modus). Der Statusabruf geht oft auch ohne, Start und Steuerung nicht. Im Entwicklermodus sind Bambu Handy und Cloud-Druck aus.
 4. Am besten dem Drucker im Router eine feste IP geben, sonst stimmt `BAMBU_HOST` irgendwann nicht mehr.
 
@@ -52,7 +52,6 @@ In `claude_desktop_config.json` (macOS: `~/Library/Application Support/Claude/`,
       "command": "/pfad/zu/bambu-mcp/.venv/bin/bambu-mcp",
       "env": {
         "BAMBU_HOST": "192.168.178.50",
-        "BAMBU_SERIAL": "0309DA123456789",
         "BAMBU_ACCESS_CODE": "12345678"
       }
     }
@@ -66,7 +65,7 @@ Unter Windows heißt der Pfad `...\.venv\Scripts\bambu-mcp.exe`. Danach Claude D
 
 ```bash
 claude mcp add bambu \
-  -e BAMBU_HOST=192.168.178.50 -e BAMBU_SERIAL=0309DA123456789 -e BAMBU_ACCESS_CODE=12345678 \
+  -e BAMBU_HOST=192.168.178.50 -e BAMBU_ACCESS_CODE=12345678 \
   -- /pfad/zu/bambu-mcp/.venv/bin/bambu-mcp
 ```
 

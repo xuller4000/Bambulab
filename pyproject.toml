@@ -15,6 +15,7 @@ test = ["pytest>=8"]
 
 [project.scripts]
 bambu-mcp = "bambu_mcp.server:main"
+bambu-find = "bambu_mcp.discovery:main"
 
 [build-system]
 requires = ["hatchling"]
