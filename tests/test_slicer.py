@@ -1,10 +1,17 @@
 import json
-import sys
-import textwrap
 
 import pytest
 
-from bambu_mcp.slicer import SliceOptions, SlicerError, apply_overrides, slice_model
+from bambu_mcp.config import Settings
+from bambu_mcp.mesh import write_stl
+from bambu_mcp.slicer import SliceOptions, SlicerError, apply_overrides
+from bambu_mcp.workflow import SliceRequest, plan, slice_request
+from conftest import box, tee
+
+
+def settings(profile_dir, tmp_path, slicer=None):
+    return Settings(host="h", serial="s", access_code="c", slicer_path=str(slicer) if slicer else None,
+                    profile_dirs=(profile_dir,), slice_output_dir=tmp_path / "out")
 
 
 def test_overrides_keep_list_shape():
@@ -20,60 +27,56 @@ def test_options_mapping():
         "layer_height": "0.16", "sparse_infill_density": "20%", "enable_support": "1",
         "support_type": "tree(auto)", "brim_type": "no_brim", "top_shell_layers": 5,
     }
-    f = o.filament_overrides()
-    assert f["nozzle_temperature"] == "210" and f["textured_plate_temp"] == "55"
+    assert o.filament_overrides()["textured_plate_temp"] == "55"
     with pytest.raises(SlicerError):
         SliceOptions(support_type="organic").process_overrides()
 
 
-@pytest.fixture
-def fake_slicer(tmp_path):
-    """A script that records its arguments and the profiles it got, then writes the output."""
-    log = tmp_path / "calls.json"
-    script = tmp_path / "fake_slicer.py"
-    script.write_text(textwrap.dedent(f"""
-        import json, sys, pathlib
-        args = sys.argv[1:]
-        outdir = pathlib.Path(args[args.index('--outputdir') + 1])
-        name = args[args.index('--export-3mf') + 1]
-        settings = args[args.index('--load-settings') + 1].split(';')
-        fil = args[args.index('--load-filaments') + 1]
-        rec = {{'args': args, 'process': json.load(open(settings[1])), 'filament': json.load(open(fil))}}
-        pathlib.Path({str(log)!r}).write_text(json.dumps(rec))
-        (outdir / name).write_bytes(b'PK')
-    """))
-    wrapper = tmp_path / "slicer"
-    wrapper.write_text(f"#!/bin/sh\nexec {sys.executable} {script} \"$@\"\n")
-    wrapper.chmod(0o755)
-    return wrapper, log
-
-
-def test_slice_model_with_fake_slicer(tmp_path, fake_slicer):
+def test_full_pipeline_with_fake_slicer(tmp_path, profile_dir, fake_slicer):
     slicer, log = fake_slicer
-    machine = tmp_path / "machine.json"
-    process = tmp_path / "process.json"
-    filament = tmp_path / "filament.json"
-    machine.write_text("{}")
-    process.write_text(json.dumps({"layer_height": "0.2", "sparse_infill_density": "15%"}))
-    filament.write_text(json.dumps({"nozzle_temperature": ["220"]}))
-    model = tmp_path / "cube.stl"
-    model.write_text("solid cube\nendsolid cube\n")
+    model = tmp_path / "tee.stl"
+    write_stl(model, tee())
+    req = SliceRequest(model_path=str(model), filament_id="GFA00", filament_type="PLA",
+                       options=SliceOptions(infill_percent=40))
+    result = slice_request(req, settings(profile_dir, tmp_path, slicer))
 
-    out = slice_model(model, SliceOptions(layer_height=0.28, nozzle_temp=200), slicer=str(slicer),
-                      machine=machine, process=process, filament=filament, output_dir=tmp_path / "out")
-
-    assert out == tmp_path / "out" / "cube.gcode.3mf" and out.is_file()
     rec = json.loads(log.read_text())
-    assert rec["process"]["layer_height"] == "0.28"
-    assert rec["process"]["sparse_infill_density"] == "15%"
-    assert rec["filament"]["nozzle_temperature"] == ["200"]
-    assert "--arrange" in rec["args"]
-    assert json.loads(process.read_text())["layer_height"] == "0.2"  # original untouched
+    assert result["presets"] == {"machine": "Bambu Lab A1 mini 0.4 nozzle", "process": "0.20mm Standard @BBL A1M",
+                                 "filament": "Bambu PLA Basic @BBL A1M"}
+    assert "inherits" not in rec["process"] and rec["machine"]["printable_height"] == "180"
+    assert rec["process"]["curr_bed_type"] == "Textured PEI Plate"
+    assert rec["process"]["wall_loops"] == "3"                 # recommendation
+    assert rec["process"]["sparse_infill_density"] == "40%"    # explicit wins
+    assert rec["process"]["enable_support"] == "0"             # turned flat, no supports
+    assert rec["process"]["outer_wall_speed"] == ["200"]
+    assert rec["model_name"] == "tee.stl" and "--arrange" in rec["args"]
+    assert result["estimate"]["print_time"] == "1 h 15 min" and result["estimate"]["weight_g"] == 12.5
+    assert result["analysis"]["orientation"] != "as modelled"
+    assert result["sliced_file"].endswith("tee.gcode.3mf")
 
 
-def test_slice_needs_profiles_for_stl(tmp_path, fake_slicer):
+def test_no_auto_tune_keeps_preset(tmp_path, profile_dir, fake_slicer):
+    slicer, log = fake_slicer
     model = tmp_path / "cube.stl"
-    model.write_text("solid")
-    with pytest.raises(SlicerError, match="BAMBU_PROFILE"):
-        slice_model(model, SliceOptions(), slicer=str(fake_slicer[0]), machine=None, process=None,
-                    filament=None, output_dir=tmp_path)
+    write_stl(model, box(0, 0, 0, 20, 20, 20))
+    slice_request(SliceRequest(model_path=str(model), auto_tune=False), settings(profile_dir, tmp_path, slicer))
+    rec = json.loads(log.read_text())
+    assert rec["process"]["wall_loops"] == "2" and rec["filament"]["name"] == "Generic PLA @BBL A1M"
+
+
+def test_plan_without_slicer_still_recommends(tmp_path, profile_dir):
+    model = tmp_path / "cube.stl"
+    write_stl(model, box(0, 0, 0, 20, 20, 20))
+    result = plan(SliceRequest(model_path=str(model), filament_type="PETG"), settings(profile_dir, tmp_path))
+    assert result["presets"]["filament"] == "Generic PETG @BBL A1M"
+    assert result["_slicer"] is None
+    with pytest.raises(SlicerError, match="No slicer found"):
+        slice_request(SliceRequest(model_path=str(model)), settings(profile_dir, tmp_path))
+
+
+def test_layer_height_checked_against_nozzle(tmp_path, profile_dir):
+    model = tmp_path / "cube.stl"
+    write_stl(model, box(0, 0, 0, 20, 20, 20))
+    with pytest.raises(SlicerError, match="nozzle"):
+        plan(SliceRequest(model_path=str(model), nozzle=0.2, options=SliceOptions(layer_height=0.28)),
+             settings(profile_dir, tmp_path))

@@ -1,12 +1,13 @@
 [project]
 name = "bambu-mcp"
 version = "0.1.0"
-description = "MCP connector for Bambu Lab printers (A1 mini) in LAN mode: status, file upload, print start, live tuning, slicing."
+description = "MCP connector for the Bambu Lab A1 mini in LAN mode: status, print control, slicing with automatically chosen settings."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "mcp>=2.3,<3",
     "paho-mqtt>=2.0,<3",
+    "numpy>=1.24",
 ]
 
 [project.optional-dependencies]

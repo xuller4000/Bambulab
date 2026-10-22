@@ -205,7 +205,7 @@ class BambuPrinter:
     # -- state --------------------------------------------------------------
 
     def refresh(self, timeout: float = 5.0) -> dict:
-        self.connect()
+        self.connect(timeout=max(timeout, 3.0))
         before = self._last_report
         self._publish_raw({"pushing": {"command": "pushall", "version": 1, "push_target": 1}})
         deadline = time.time() + timeout

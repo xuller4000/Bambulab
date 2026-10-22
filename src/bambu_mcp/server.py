@@ -17,13 +17,23 @@ from . import camera
 from .config import ConfigError, Settings
 from .ftps import PrinterFiles
 from .printer import BambuPrinter, PrinterError, summarize
-from .slicer import SliceOptions, SlicerError, slice_model
+from .mesh import MeshError, analyze
+from .profiles import ProfileError, machine_name
+from .slicer import SliceOptions, SlicerError
+from .workflow import NOZZLES, PLATE_TYPES, SliceRequest, library_for, plan, public, slice_request
 
 INSTRUCTIONS = """\
-Controls a Bambu Lab A1 mini on the local network.
-Typical flow: printer_status -> upload_and_print (already sliced .gcode.3mf)
-or slice_and_print (STL/3MF plus settings). Before starting a print, check that
-the printer is idle and the plate is clear; ask the user if unsure.
+Controls a Bambu Lab A1 mini on the local network and slices models for it.
+For a model file (STL/3MF/OBJ): slice_model_file or slice_and_print. They
+analyse the geometry and pick the best settings automatically (auto_tune):
+preset, layer height, walls, infill, supports, brim, orientation, using the
+filament loaded in the printer. Only pass explicit settings the user asked
+for; they override the recommendation. Show the user the reasons, warnings
+and the time/weight estimate. Ask about the purpose (quality, strength,
+speed) when it is unclear and matters. recommend_print_settings previews
+the choice without slicing.
+For an already sliced .gcode.3mf: upload_and_print. Before starting a print,
+check that the printer is idle and the plate is clear; ask the user if unsure.
 Live tuning while printing: set_print_speed, set_temperature, set_part_fan.
 """
 
@@ -57,7 +67,7 @@ async def run(fn, *args, **kwargs) -> Any:
     """Run blocking printer I/O off the event loop and turn errors into tool errors."""
     try:
         return await asyncio.to_thread(functools.partial(fn, *args, **kwargs))
-    except (PrinterError, SlicerError, ConfigError, FileNotFoundError) as exc:
+    except (PrinterError, SlicerError, ProfileError, MeshError, ConfigError, FileNotFoundError) as exc:
         raise ToolError(str(exc)) from exc
     except OSError as exc:
         raise ToolError(f"Network error talking to the printer: {exc}") from exc
@@ -253,27 +263,34 @@ async def send_gcode(gcode: Annotated[str, Field(description="One or more G-code
 
 # -- slicing -----------------------------------------------------------------
 
-def _options(**kw) -> SliceOptions:
-    extra_process = kw.pop("extra_process_settings") or {}
-    extra_filament = kw.pop("extra_filament_settings") or {}
-    return SliceOptions(**kw, extra_process=extra_process, extra_filament=extra_filament)
-
-
-async def _slice(model_path: str, opts: SliceOptions):
-    s = settings()
-    return await run(
-        slice_model, model_path, opts, slicer=s.slicer_path, machine=s.profile_machine,
-        process=s.profile_process, filament=s.profile_filament, output_dir=s.slice_output_dir,
-    )
-
-
-LayerHeight = Annotated[float | None, Field(ge=0.04, le=0.32, description="Layer height in mm")]
+Purpose = Annotated[
+    Literal["auto", "balanced", "quality", "strength", "speed"],
+    Field(description="auto: decided from the model. quality = fine visible surfaces, "
+                      "strength = functional/load-bearing, speed = quick draft"),
+]
+FilamentType = Annotated[
+    str | None, Field(description="PLA, PETG, TPU, PLA-CF ... Empty: use what is loaded in the printer, else PLA")
+]
+FilamentPreset = Annotated[
+    str | None, Field(description="Exact slicer filament preset, e.g. 'Bambu PLA Matte @BBL A1M' (see list_filament_presets)")
+]
+UsePrinterFilament = Annotated[
+    bool, Field(description="Ask the printer which filament is loaded when no filament is given")
+]
+Nozzle = Annotated[float | None, Field(description="Nozzle diameter 0.2/0.4/0.6/0.8. Empty: read from printer, else 0.4")]
+PlateType = Annotated[
+    Literal["textured_pei", "smooth_pei", "cool_plate", "engineering"] | None,
+    Field(description="Build plate; the A1 mini ships with textured PEI"),
+]
+AutoTune = Annotated[bool, Field(description="Choose settings from the model geometry (recommended)")]
+AutoOrient = Annotated[bool, Field(description="Rotate the model if that clearly saves supports or height")]
+LayerHeight = Annotated[float | None, Field(ge=0.04, le=0.64, description="Layer height in mm")]
 Infill = Annotated[int | None, Field(ge=0, le=100, description="Sparse infill density in %")]
 InfillPattern = Annotated[
     str | None, Field(description="e.g. grid, gyroid, cubic, crosshatch, zig-zag, honeycomb, lightning")
 ]
 Walls = Annotated[int | None, Field(ge=1, le=20, description="Number of perimeters")]
-Supports = Annotated[bool | None, Field(description="Generate supports")]
+Supports = Annotated[bool | None, Field(description="Force supports on/off")]
 SupportType = Annotated[Literal["normal", "tree"] | None, Field(description="Support style")]
 Brim = Annotated[Literal["auto", "none", "outer"] | None, Field(description="Brim mode")]
 NozzleTemp = Annotated[int | None, Field(ge=150, le=300, description="Nozzle temperature °C")]
@@ -286,11 +303,115 @@ ExtraFilament = Annotated[
     dict[str, Any] | None,
     Field(description="Any other filament setting by its slicer key, e.g. {'fan_max_speed': 80}"),
 ]
+ModelPath = Annotated[str, Field(description="STL/3MF/OBJ/STEP file on this computer")]
+
+
+def _printer_info(ams_slot: int | None = None) -> dict:
+    """Loaded filament and nozzle as reported by the printer; empty if it is not reachable."""
+    try:
+        p = printer()
+        state = p.raw_state() or p.refresh(timeout=4)
+    except Exception:
+        return {}
+    report = state.get("print", {})
+    tray = report.get("vt_tray") or {}
+    if ams_slot is not None:
+        for unit in (report.get("ams") or {}).get("ams") or []:
+            for t in unit.get("tray", []):
+                if str(unit.get("id")) == "0" and str(t.get("id")) == str(ams_slot):
+                    tray = t
+    info = {"type": tray.get("tray_type") or None, "id": tray.get("tray_info_idx") or None}
+    try:
+        info["nozzle"] = float(report.get("nozzle_diameter"))
+    except (TypeError, ValueError):
+        pass
+    return info
+
+
+def _build_request(model_path: str, purpose: str, filament_type: str | None, filament_preset: str | None,
+                   use_printer_filament: bool, nozzle: float | None, plate_type: str | None,
+                   auto_tune: bool, auto_orient: bool, options: SliceOptions,
+                   ams_slot: int | None = None) -> tuple[SliceRequest, dict]:
+    s = settings()
+    source: dict[str, Any] = {}
+    filament_id = None
+    if use_printer_filament and not (filament_type or filament_preset) or nozzle is None and s.nozzle is None:
+        info = _printer_info(ams_slot)
+        if use_printer_filament and not (filament_type or filament_preset) and (info.get("type") or info.get("id")):
+            filament_type, filament_id = info.get("type"), info.get("id")
+            source["filament"] = f"loaded in printer ({filament_type}, id {filament_id})"
+        if nozzle is None and s.nozzle is None and info.get("nozzle") in NOZZLES:
+            nozzle = info["nozzle"]
+            source["nozzle"] = "reported by printer"
+    req = SliceRequest(
+        model_path=model_path, purpose=purpose, filament_type=filament_type, filament_id=filament_id,
+        filament_preset=filament_preset, nozzle=nozzle or s.nozzle or 0.4,
+        plate_type=plate_type or s.plate_type, auto_tune=auto_tune, auto_orient=auto_orient, options=options,
+    )
+    return req, source
+
+
+def _options(layer_height, infill_percent, infill_pattern, wall_loops, supports, support_type, brim,
+             nozzle_temp, bed_temp, extra_process_settings, extra_filament_settings) -> SliceOptions:
+    return SliceOptions(
+        layer_height=layer_height, infill_percent=infill_percent, infill_pattern=infill_pattern,
+        wall_loops=wall_loops, supports=supports, support_type=support_type, brim=brim,
+        nozzle_temp=nozzle_temp, bed_temp=bed_temp,
+        extra_process=extra_process_settings or {}, extra_filament=extra_filament_settings or {},
+    )
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def analyze_model(model_path: ModelPath, auto_orient: AutoOrient = True) -> dict:
+    """Geometry check: size, volume, bed contact, overhangs needing support, best orientation, fit on the A1 mini."""
+    analysis, _ = await run(analyze, model_path, auto_orient=auto_orient)
+    return analysis.to_dict()
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def recommend_print_settings(
+    model_path: ModelPath,
+    purpose: Purpose = "auto",
+    filament_type: FilamentType = None,
+    filament_preset: FilamentPreset = None,
+    use_printer_filament: UsePrinterFilament = True,
+    nozzle: Nozzle = None,
+    plate_type: PlateType = None,
+) -> dict:
+    """Preview the settings slice_model_file would choose, with reasons and warnings, without slicing."""
+    req, source = await run(_build_request, model_path, purpose, filament_type, filament_preset,
+                            use_printer_filament, nozzle, plate_type, True, True, SliceOptions())
+    result = public(await run(plan, req, settings()))
+    return result | ({"detected": source} if source else {})
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def list_filament_presets(
+    contains: Annotated[str | None, Field(description="Filter, e.g. 'PETG' or 'Matte'")] = None,
+    nozzle: Nozzle = None,
+) -> list[str]:
+    """Filament presets of the installed slicer that fit the A1 mini."""
+    lib, _ = await run(library_for, settings())
+    if not lib:
+        raise ToolError("No slicer profiles found; install Bambu Studio/OrcaSlicer or set BAMBU_PROFILE_DIR")
+    machine = machine_name(nozzle or settings().nozzle or 0.4)
+    names = [p["name"] for p in await run(lib.selectable, "filament", machine)]
+    if contains:
+        names = [n for n in names if contains.lower() in n.lower()]
+    return sorted(names)
 
 
 @mcp.tool(annotations=ACTION)
 async def slice_model_file(
-    model_path: Annotated[str, Field(description="STL/3MF/OBJ/STEP file on this computer")],
+    model_path: ModelPath,
+    purpose: Purpose = "auto",
+    filament_type: FilamentType = None,
+    filament_preset: FilamentPreset = None,
+    use_printer_filament: UsePrinterFilament = True,
+    nozzle: Nozzle = None,
+    plate_type: PlateType = None,
+    auto_tune: AutoTune = True,
+    auto_orient: AutoOrient = True,
     layer_height: LayerHeight = None,
     infill_percent: Infill = None,
     infill_pattern: InfillPattern = None,
@@ -303,15 +424,30 @@ async def slice_model_file(
     extra_process_settings: ExtraProcess = None,
     extra_filament_settings: ExtraFilament = None,
 ) -> dict:
-    """Slice a model with the configured profiles plus the given overrides. Returns the .gcode.3mf path."""
-    opts = _options(**{k: v for k, v in locals().items() if k != "model_path"})
-    out = await _slice(model_path, opts)
-    return {"sliced_file": str(out), "overrides": opts.process_overrides() | opts.filament_overrides()}
+    """Slice a model with automatically chosen best settings. Explicit settings override the choice.
+
+    Returns the .gcode.3mf path, chosen presets, every change with its reason, and the
+    slicer's print time and filament estimate.
+    """
+    opts = _options(layer_height, infill_percent, infill_pattern, wall_loops, supports, support_type, brim,
+                    nozzle_temp, bed_temp, extra_process_settings, extra_filament_settings)
+    req, source = await run(_build_request, model_path, purpose, filament_type, filament_preset,
+                            use_printer_filament, nozzle, plate_type, auto_tune, auto_orient, opts)
+    result = await run(slice_request, req, settings())
+    return result | ({"detected": source} if source else {})
 
 
 @mcp.tool(annotations=ACTION)
 async def slice_and_print(
-    model_path: Annotated[str, Field(description="STL/3MF/OBJ/STEP file on this computer")],
+    model_path: ModelPath,
+    purpose: Purpose = "auto",
+    filament_type: FilamentType = None,
+    filament_preset: FilamentPreset = None,
+    use_printer_filament: UsePrinterFilament = True,
+    nozzle: Nozzle = None,
+    plate_type: PlateType = None,
+    auto_tune: AutoTune = True,
+    auto_orient: AutoOrient = True,
     layer_height: LayerHeight = None,
     infill_percent: Infill = None,
     infill_pattern: InfillPattern = None,
@@ -327,18 +463,21 @@ async def slice_and_print(
     flow_calibration: FlowCali = True,
     vibration_calibration: VibrationCali = True,
     timelapse: Timelapse = False,
-    use_ams: UseAms = False,
-    ams_mapping: AmsMapping = None,
+    ams_slot: Annotated[int | None, Field(ge=0, le=3, description="AMS lite slot to print from; empty = external spool")] = None,
 ) -> dict:
-    """Slice a model with the given settings, upload it and start the print (plate 1)."""
-    start_keys = ("bed_leveling", "flow_calibration", "vibration_calibration", "timelapse", "use_ams", "ams_mapping")
-    args = {k: v for k, v in locals().items() if k != "model_path"}
-    start_opts = {k: args.pop(k) for k in start_keys}
-    opts = _options(**args)
-    out = await _slice(model_path, opts)
-    uploaded = await run(files().upload, out)
-    started = await _start(uploaded["remote_name"], plate=1, **start_opts)
-    return {"sliced_file": str(out), "upload": uploaded, **started}
+    """Slice with automatically chosen best settings, upload and start the print (plate 1)."""
+    opts = _options(layer_height, infill_percent, infill_pattern, wall_loops, supports, support_type, brim,
+                    nozzle_temp, bed_temp, extra_process_settings, extra_filament_settings)
+    req, source = await run(_build_request, model_path, purpose, filament_type, filament_preset,
+                            use_printer_filament, nozzle, plate_type, auto_tune, auto_orient, opts, ams_slot)
+    result = await run(slice_request, req, settings())
+    uploaded = await run(files().upload, result["sliced_file"])
+    started = await _start(
+        uploaded["remote_name"], plate=1, bed_leveling=bed_leveling, flow_calibration=flow_calibration,
+        vibration_calibration=vibration_calibration, timelapse=timelapse,
+        use_ams=ams_slot is not None, ams_mapping=[ams_slot] if ams_slot is not None else None,
+    )
+    return result | ({"detected": source} if source else {}) | {"upload": uploaded, **started}
 
 
 def main() -> None:

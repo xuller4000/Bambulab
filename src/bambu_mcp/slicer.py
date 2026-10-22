@@ -1,17 +1,17 @@
-"""Slicing through the Bambu Studio or OrcaSlicer command line.
+"""Running the Bambu Studio or OrcaSlicer command line.
 
-Profiles are the JSON files the slicer itself uses (machine, process,
-filament). Overrides are written into temporary copies, so the originals stay
-untouched. Values keep the slicer's own format: scalars are strings, and keys
-that hold a list (most filament keys, one entry per extruder) stay lists.
+Profiles are passed as complete (flattened) JSON files written to a temporary
+folder. Values keep the slicer's own format: scalars are strings, and keys that
+hold a list (most filament keys, one entry per extruder) stay lists.
 """
 
 from __future__ import annotations
 
 import json
-import shutil
 import subprocess
 import tempfile
+import xml.etree.ElementTree as ET
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -26,6 +26,8 @@ class SlicerError(RuntimeError):
 
 @dataclass
 class SliceOptions:
+    """Settings the user asked for explicitly. They win over any recommendation."""
+
     layer_height: float | None = None
     infill_percent: int | None = None
     infill_pattern: str | None = None
@@ -41,8 +43,6 @@ class SliceOptions:
     def process_overrides(self) -> dict[str, Any]:
         out: dict[str, Any] = {}
         if self.layer_height is not None:
-            if not 0.04 <= self.layer_height <= 0.32:
-                raise SlicerError("layer_height must be between 0.04 and 0.32 mm for a 0.4 mm nozzle")
             out["layer_height"] = f"{self.layer_height:g}"
         if self.infill_percent is not None:
             if not 0 <= self.infill_percent <= 100:
@@ -77,9 +77,6 @@ class SliceOptions:
         out.update(self.extra_filament)
         return out
 
-    def is_empty(self) -> bool:
-        return not self.process_overrides() and not self.filament_overrides()
-
 
 def apply_overrides(profile: dict, overrides: dict[str, Any]) -> dict:
     result = dict(profile)
@@ -97,13 +94,6 @@ def _to_str(value: Any) -> str:
     return f"{value:g}" if isinstance(value, float) else str(value)
 
 
-def _load_json(path: Path) -> dict:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise SlicerError(f"Cannot read profile {path}: {exc}") from exc
-
-
 def build_command(
     slicer: str,
     model: Path,
@@ -113,73 +103,92 @@ def build_command(
     machine: Path | None,
     process: Path | None,
     filament: Path | None,
+    arrange: bool,
 ) -> list[str]:
     cmd = [slicer, "--slice", "0", "--outputdir", str(output_dir), "--export-3mf", output_name]
     if machine and process:
         cmd += ["--load-settings", f"{machine};{process}"]
     if filament:
         cmd += ["--load-filaments", str(filament)]
-    if model.suffix.lower() != ".3mf":
-        cmd += ["--arrange", "1", "--orient", "1"]
+    if arrange:
+        cmd += ["--arrange", "1", "--orient", "0"]
     cmd.append(str(model))
     return cmd
 
 
-def slice_model(
-    model_path: str | Path,
-    options: SliceOptions,
-    *,
-    slicer: str | None,
-    machine: Path | None,
-    process: Path | None,
-    filament: Path | None,
+def output_name_for(model: Path) -> str:
+    name = model.name
+    stem = name[: -len(".gcode.3mf")] if name.lower().endswith(".gcode.3mf") else model.stem
+    return f"{stem}.gcode.3mf"
+
+
+def run_slicer(
+    executable: str,
+    model: Path,
     output_dir: Path,
-    timeout: float = 600,
+    *,
+    output_name: str | None = None,
+    machine: dict | None = None,
+    process: dict | None = None,
+    filament: dict | None = None,
+    timeout: float = 900,
 ) -> Path:
-    if not slicer:
-        raise SlicerError("BAMBU_SLICER_PATH is not set (path to the Bambu Studio or OrcaSlicer executable)")
-    executable = shutil.which(slicer) or (slicer if Path(slicer).exists() else None)
-    if not executable:
-        raise SlicerError(f"Slicer not found: {slicer}")
-    model = Path(model_path).expanduser().resolve()
-    if not model.is_file():
-        raise SlicerError(f"Model not found: {model}")
-    if model.suffix.lower() not in (".stl", ".3mf", ".obj", ".step", ".stp"):
-        raise SlicerError("Supported model formats: .stl, .3mf, .obj, .step")
-
-    has_profiles = bool(machine and process and filament)
-    if not has_profiles and (model.suffix.lower() != ".3mf" or not options.is_empty()):
-        raise SlicerError(
-            "Slicing a bare model or changing settings needs BAMBU_PROFILE_MACHINE, "
-            "BAMBU_PROFILE_PROCESS and BAMBU_PROFILE_FILAMENT"
-        )
-
     output_dir.mkdir(parents=True, exist_ok=True)
-    stem = model.name[: -len(".gcode.3mf")] if model.name.lower().endswith(".gcode.3mf") else model.stem
-    output_name = f"{stem}.gcode.3mf"
-
+    output_name = output_name or output_name_for(model)
     with tempfile.TemporaryDirectory(prefix="bambu-mcp-") as tmp:
-        tmpdir = Path(tmp)
-        if has_profiles:
-            proc_file = tmpdir / "process.json"
-            fil_file = tmpdir / "filament.json"
-            proc_file.write_text(json.dumps(apply_overrides(_load_json(process), options.process_overrides())))
-            fil_file.write_text(json.dumps(apply_overrides(_load_json(filament), options.filament_overrides())))
-            machine_file: Path | None = machine
-        else:
-            proc_file = fil_file = machine_file = None
-
+        files: dict[str, Path | None] = {}
+        for kind, data in (("machine", machine), ("process", process), ("filament", filament)):
+            if data is None:
+                files[kind] = None
+                continue
+            files[kind] = Path(tmp) / f"{kind}.json"
+            files[kind].write_text(json.dumps(data, indent=1), encoding="utf-8")
         cmd = build_command(
             executable, model, output_dir, output_name,
-            machine=machine_file, process=proc_file, filament=fil_file,
+            machine=files["machine"], process=files["process"], filament=files["filament"],
+            arrange=model.suffix.lower() != ".3mf",
         )
         try:
             run = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         except subprocess.TimeoutExpired as exc:
             raise SlicerError(f"Slicer timed out after {timeout:.0f} s") from exc
+        except OSError as exc:
+            raise SlicerError(f"Could not start the slicer: {exc}") from exc
 
     result = output_dir / output_name
     if run.returncode != 0 or not result.is_file():
-        tail = "\n".join((run.stdout + run.stderr).strip().splitlines()[-20:])
+        tail = "\n".join((run.stdout + run.stderr).strip().splitlines()[-25:])
         raise SlicerError(f"Slicing failed (exit {run.returncode}):\n{tail}")
     return result
+
+
+def read_slice_info(path: Path) -> dict:
+    """Print time, filament use and slicer warnings from a sliced 3MF."""
+    try:
+        with zipfile.ZipFile(path) as z:
+            root = ET.fromstring(z.read("Metadata/slice_info.config"))
+    except (KeyError, zipfile.BadZipFile, ET.ParseError):
+        return {}
+    plates = []
+    for plate in root.iter("plate"):
+        meta = {m.get("key"): m.get("value") for m in plate.findall("metadata")}
+        info: dict[str, Any] = {"plate": int(meta.get("index", len(plates) + 1))}
+        if (sec := meta.get("prediction")) and sec.isdigit():
+            s = int(sec)
+            info["print_time"] = f"{s // 3600} h {s % 3600 // 60:02d} min"
+            info["print_seconds"] = s
+        if weight := meta.get("weight"):
+            info["weight_g"] = float(weight)
+        if meta.get("support_used") is not None:
+            info["support_used"] = meta["support_used"] == "true"
+        if meta.get("outside") == "true":
+            info["outside_build_area"] = True
+        info["filaments"] = [
+            {k: f.get(k) for k in ("type", "color", "used_m", "used_g", "tray_info_idx") if f.get(k)}
+            for f in plate.findall("filament")
+        ]
+        warnings = [w.get("msg") for w in plate.findall("warning") if w.get("msg")]
+        if warnings:
+            info["slicer_warnings"] = warnings
+        plates.append(info)
+    return {"plates": plates} if len(plates) != 1 else plates[0]

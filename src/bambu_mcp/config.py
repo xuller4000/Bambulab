@@ -25,6 +25,9 @@ class Settings:
     profile_machine: Path | None = None
     profile_process: Path | None = None
     profile_filament: Path | None = None
+    profile_dirs: tuple[Path, ...] = ()
+    plate_type: str = "textured_pei"
+    nozzle: float | None = None
     slice_output_dir: Path = Path.home() / ".cache" / "bambu-mcp"
 
     @classmethod
@@ -53,5 +56,10 @@ class Settings:
             profile_machine=path("BAMBU_PROFILE_MACHINE"),
             profile_process=path("BAMBU_PROFILE_PROCESS"),
             profile_filament=path("BAMBU_PROFILE_FILAMENT"),
+            profile_dirs=tuple(
+                Path(p).expanduser() for p in env.get("BAMBU_PROFILE_DIR", "").split(os.pathsep) if p
+            ),
+            plate_type=env.get("BAMBU_PLATE_TYPE", "textured_pei"),
+            nozzle=float(env["BAMBU_NOZZLE"]) if env.get("BAMBU_NOZZLE") else None,
             slice_output_dir=path("BAMBU_SLICE_OUTPUT_DIR") or cls.slice_output_dir,
         )
