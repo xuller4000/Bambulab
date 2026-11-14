@@ -1,0 +1,70 @@
+name: Deploy to Cloudflare
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency: deploy
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+
+      # The secrets only enter this step; it hands cleaned values to the later steps via GITHUB_ENV.
+      - name: Check secrets
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CONNECTOR_SECRET: ${{ secrets.CONNECTOR_SECRET }}
+        run: |
+          for v in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID CONNECTOR_SECRET; do
+            if [ -z "${!v}" ]; then echo "::error::GitHub secret $v fehlt"; exit 1; fi
+            # Pasted values easily pick up spaces or extra lines; keep the first non-empty line, trimmed.
+            clean=$(printf '%s\n' "${!v}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -m1 .)
+            if [ "$clean" != "${!v}" ]; then
+              # Only the shape of the value is logged, never its content.
+              shape=$(printf '%s\n' "${!v}" | awk '{ printf "%s%d", (NR > 1 ? ", " : ""), length($0) }')
+              echo "::warning::GitHub secret $v enthielt Leerzeichen oder mehrere Zeilen (Zeichen pro Zeile: $shape), verwendet wird nur die erste Zeile"
+            fi
+            echo "::add-mask::$clean"
+            echo "$v=$clean" >> "$GITHUB_ENV"
+          done
+          CONNECTOR_SECRET=$(printf '%s\n' "$CONNECTOR_SECRET" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -m1 .)
+          if [ ${#CONNECTOR_SECRET} -lt 24 ]; then echo "::error::CONNECTOR_SECRET muss mindestens 24 Zeichen haben"; exit 1; fi
+
+      - name: Check Cloudflare token
+        run: |
+          # User tokens verify under /user, account-owned tokens under /accounts/<id>.
+          for path in user "accounts/$CLOUDFLARE_ACCOUNT_ID"; do
+            status=$(curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "https://api.cloudflare.com/client/v4/$path/tokens/verify" | jq -r '.result.status // empty')
+            if [ "$status" = "active" ]; then echo "Token gültig ($path)"; ok=1; break; fi
+          done
+          if [ -z "$ok" ]; then
+            echo "::error::Cloudflare kennt das Token nicht (Länge ${#CLOUDFLARE_API_TOKEN} Zeichen, ein Token hat normalerweise 40). Token in Cloudflare neu erstellen und nur den Token-Wert als CLOUDFLARE_API_TOKEN eintragen."
+            exit 1
+          fi
+          # The account ID has to be one the token was created for.
+          ids=$(curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "https://api.cloudflare.com/client/v4/accounts?per_page=50" | jq -r '.result[]?.id')
+          count=$(printf '%s\n' "$ids" | grep -c . || true)
+          if printf '%s\n' "$ids" | grep -qx "$CLOUDFLARE_ACCOUNT_ID"; then
+            echo "Account-ID passt zum Token"
+          elif [ "$count" = 1 ]; then
+            echo "::warning::CLOUDFLARE_ACCOUNT_ID passt nicht zum Token, verwendet wird der einzige Account, auf den das Token Zugriff hat. Bitte das Secret korrigieren."
+            echo "::add-mask::$ids"
+            echo "CLOUDFLARE_ACCOUNT_ID=$ids" >> "$GITHUB_ENV"
+          else
+            echo "::error::CLOUDFLARE_ACCOUNT_ID passt nicht zum Token (das Token sieht $count Accounts). Account-ID im Cloudflare-Dashboard prüfen oder beim Token den richtigen Account auswählen."
+            exit 1
+          fi
+
+      - run: npx wrangler deploy
+      - run: printf '%s' "$CONNECTOR_SECRET" | npx wrangler secret put CONNECTOR_SECRET
